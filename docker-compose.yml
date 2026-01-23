@@ -1,0 +1,77 @@
+services:
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - db:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  api:
+    build: ./svc/api
+    environment:
+      DB: postgresql://app:app@db:5432/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+  loader:
+    build: ./svc/loader
+    environment:
+      DB: postgresql://app:app@db:5432/app
+      HF_REPO: d0rj/geo-reviews-dataset-2023
+      HF_FILE: data/train-00000-of-00001-49261e4e5a35a5a0.parquet
+    depends_on:
+      - db
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+
+  mcp:
+    build: ./svc/mcp
+    environment:
+      DATA_API: http://api:8000
+    ports:
+      - "8787:8787"
+    depends_on:
+      - api
+  
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models:/models:ro
+    command:
+      [
+        "-m", "/models/qwen2.5-1.5b/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        "--host", "0.0.0.0",
+        "--port", "8080",
+        "--alias", "qwen2.5-1.5b",
+        "-c", "2048",
+        "-n", "256"
+      ]
+
+  orch:
+    build: ./svc/orchestrator
+    environment:
+      MCP_URL: http://mcp:8787/mcp
+      DATA_API: http://api:8000
+      LLM_CHAT_URL: http://llm:8080/v1/chat/completions
+      LLM_MODEL: qwen2.5-1.5b
+    ports:
+      - "9000:9000"
+    depends_on:
+      - mcp
+      - llm
+    restart: unless-stopped
+
+
+volumes:
+  db:
+  hf_cache:
