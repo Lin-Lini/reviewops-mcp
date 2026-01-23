@@ -37,5 +37,19 @@ async def negative_insights(
         p["a0"] = a0
     return await get("/insights/negative", p)
 
+@mcp.tool()
+async def leaders_worst(rubric: str, a0: str | None = None, min_reviews: int = 20, n: int = 10):
+    p = {"rubric": rubric, "min_reviews": min_reviews, "n": n}
+    if a0:
+        p["a0"] = a0
+    return await get("/leaders/worst", p)
+
+@mcp.tool()
+async def leaders_best(rubric: str, a0: str | None = None, min_reviews: int = 20, n: int = 10):
+    p = {"rubric": rubric, "min_reviews": min_reviews, "n": n}
+    if a0:
+        p["a0"] = a0
+    return await get("/leaders/best", p)
+
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8787)

@@ -9,6 +9,8 @@ from .routes.meta import router as meta_router
 from .routes.org import router as org_router
 from .routes.search import router as search_router
 from .routes.insights import router as insights_router
+from .routes.leaders import router as leaders_router
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -23,3 +25,4 @@ app.include_router(meta_router, tags=["meta"])
 app.include_router(org_router, tags=["org"])
 app.include_router(search_router, tags=["search"])
 app.include_router(insights_router, tags=["insights"])
+app.include_router(leaders_router, tags=["leaders"])

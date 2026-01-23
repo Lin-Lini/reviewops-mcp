@@ -4,7 +4,7 @@ from ..db import fetch_all
 router = APIRouter()
 
 @router.get("/health")
-def health():
+async def health():
     return {"ok": True}
 
 @router.get("/rubrics/top")

@@ -15,7 +15,7 @@ from .formatter import compact_context, context_to_text
 
 class ChatIn(BaseModel):
     message: str
-    mode: str | None = "auto"  # auto | search | insights
+    mode: str | None = "auto"  # auto | search | insights | leaders
 
 
 class ChatOut(BaseModel):
@@ -120,6 +120,63 @@ async def chat(inp: ChatIn):
             temperature=0.2,
         )
         return ChatOut(answer=answer, tool_used=tool_used, tool_args=tool_args, context=ctx, mcp_used=used_mcp)
+    
+    # LEADERS
+    is_worst = ("худш" in m) or ("антилидер" in m) or ("плох" in m)
+    is_best = ("луч" in m) and not is_worst
+    wants_leaders = (inp.mode == "leaders") or is_worst or is_best or ("топ" in m and ("луч" in m or "худ" in m or "рейтинг" in m))
+
+    if wants_leaders:
+        rubrics = getattr(app.state, "rubrics", [])
+        regions = getattr(app.state, "regions", [])
+
+        rubric = infer_rubric(msg, rubrics)
+        a0 = infer_region(msg, regions)
+
+        if rubric is None or a0 is None:
+            rb2, a02 = await pick_filters_with_llm(llm, msg, rubrics, regions)
+            rubric = rubric or rb2
+            a0 = a0 or a02
+
+        if (inp.mode == "leaders" and not is_worst and not is_best and "негатив" in m) or is_worst:
+            tool_used = "leaders_worst"
+        else:
+            tool_used = "leaders_best"
+
+        tool_args = {
+            "rubric": rubric or "Кафе",
+            "min_reviews": s.leaders_min_reviews,
+            "n": s.leaders_n,
+        }
+        if a0:
+            tool_args["a0"] = a0
+
+        used_mcp, items = await call_tool(tool_used, tool_args)
+
+        rows = []
+        if isinstance(items, list):
+            for x in items[: s.leaders_n]:
+                if isinstance(x, dict):
+                    rows.append({
+                        "name_ru": x.get("name_ru"),
+                        "address": x.get("address"),
+                        "reviews": int(x.get("reviews") or 0),
+                        "avg_rating": round(float(x.get("avg_rating") or 0.0), 3),
+                    })
+
+        ctx = {"filters": {"rubric": tool_args["rubric"], "a0": tool_args.get("a0")}, "items": rows}
+
+        title = "Худшие" if tool_used == "leaders_worst" else "Лучшие"
+        place = f" в {a0}" if a0 else ""
+        head = f"{title} {tool_args['rubric']}{place} (min_reviews={tool_args['min_reviews']})"
+
+        lines = [head]
+        for i, r in enumerate(rows, 1):
+            lines.append(f"{i}) {r['name_ru']} — {r['address']} — avg={r['avg_rating']} — reviews={r['reviews']}")
+
+        answer = "\n".join(lines)
+
+        return ChatOut(answer=answer, tool_used=tool_used, tool_args=tool_args, context=ctx, mcp_used=used_mcp)
 
     # INSIGHTS (default for analytic questions)
     if inp.mode == "insights" or ("негатив" in m or "жалоб" in m or "почему" in m or "причин" in m):
@@ -151,18 +208,24 @@ async def chat(inp: ChatIn):
         ctx_text = context_to_text(ctx)
 
         sys = (
-            "Ты аналитик отзывов. Используй только контекст. Не выдумывай факты. "
-            "Причины бери из блока 'Причины (агрегаты)'. "
-            "Формат: 1) Итог; 2) 5 причин; 3) 3 цитаты; 4) 5 действий."
+        "Ты аналитик отзывов. Используй только контекст.\n"
+        "Запрещено придумывать факты.\n"
+        "Причины: возьми ВСЕ строки label из блока 'Причины (агрегаты)'. Если их меньше 5 — не выдумывай.\n"
+        "Не объясняй причины своими словами.\n"
+        "Цитаты: 3 штуки ТОЛЬКО из блока 'Цитаты'.\n"
+        "Действия: 5 действий, каждое привяжи к одной причине (по смыслу), без выдуманных деталей.\n"
+        "Формат строго:\n"
+        "1) Итог: ...\n"
+        "2) Причины:\n- ...\n"
+        "3) Цитаты:\n- ...\n"
+        "4) Что улучшить:\n- ..."
         )
         user = f"Запрос: {msg}\n\n{ctx_text}"
-
         answer = await llm.chat(
             [{"role": "system", "content": sys}, {"role": "user", "content": user}],
             max_tokens=320,
             temperature=0.2,
         )
-
         return ChatOut(answer=answer, tool_used=tool_used, tool_args=tool_args, context=ctx, mcp_used=used_mcp)
 
     # fallback
