@@ -105,12 +105,20 @@ class ToolClient:
                 if args.get("a0"):
                     p["a0"] = args["a0"]
                 r = await hc.get(f"{self.data_api}/leaders/worst", params=p)
-
             elif name == "leaders_best":
                 p = {"rubric": args["rubric"], "min_reviews": args.get("min_reviews", 20), "n": args.get("n", 10)}
                 if args.get("a0"):
                     p["a0"] = args["a0"]
                 r = await hc.get(f"{self.data_api}/leaders/best", params=p)
+            elif name == "org_negative_insights":
+                r = await hc.get(
+                    f"{self.data_api}/org/{args['org_key']}/insights/negative",
+                    params={
+                        "n_terms": args.get("n_terms", 20),
+                        "n_samples": args.get("n_samples", 5),
+                        "max_docs": args.get("max_docs", 3000),
+                    },
+                )
 
             else:
                 raise ValueError(f"unknown tool: {name}")

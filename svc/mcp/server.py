@@ -51,5 +51,9 @@ async def leaders_best(rubric: str, a0: str | None = None, min_reviews: int = 20
         p["a0"] = a0
     return await get("/leaders/best", p)
 
+@mcp.tool()
+async def org_negative_insights(org_key: str, n_terms: int = 20, n_samples: int = 5, max_docs: int = 3000):
+    return await get(f"/org/{org_key}/insights/negative", {"n_terms": n_terms, "n_samples": n_samples, "max_docs": max_docs})
+
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8787)
