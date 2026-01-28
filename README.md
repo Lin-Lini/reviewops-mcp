@@ -16,7 +16,7 @@
 
 ### LLM-слой (локально или через прокси)
 - **Локально**: `llama.cpp server` с GGUF-моделью (OpenAI-compatible `/v1/chat/completions`).
-- **Удаленно**: LLM gateway проксирует запросы в OpenAI-compatible endpoint (например ProxyAPI).
+- **Удаленно**: LLM gateway проксирует запросы в OpenAI-compatible endpoint (например, ProxyAPI).
 - Orchestrator использует LLM **точечно** (summary/compare), а вычисление причин и выбор evidence выполняется детерминированно на базе данных (для снижения риска галлюцинаций).
 
 ### Инженерные характеристики
@@ -29,6 +29,34 @@
 ---
 
 ## Архитектура
+
+### Потоки запросов и данных (Request/Data Flow)
+
+```mermaid
+flowchart LR
+  U[User / Client] -->|POST /chat| ORCH[orch: Orchestrator<br/>LLM gateway]
+  ORCH -->|SSE /mcp (tools)| MCP[mcp: FastMCP server]
+  MCP -->|HTTP| API[api: Analytics API (FastAPI)]
+  API -->|SQL| DB[(db: Postgres)]
+  ORCH -->|OpenAI-compatible<br/>/v1/chat/completions| LLM[llm: llama.cpp server]
+
+  ORCH --> LOG[logsvc: events]
+  MCP --> LOG
+  API --> LOG
+
+  SEC[security: JWT (opt)] -.-> ORCH
+  MOD[moderator: input/output (opt)] -.-> ORCH
+```
+
+**Логика взаимодействия:**
+1. Orchestrator принимает запрос пользователя (`POST /chat`).
+2. При необходимости контекста/статистики Orchestrator вызывает инструменты через MCP (`/mcp`, SSE).
+3. MCP проксирует вызовы tools на Analytics API.
+4. Analytics API выполняет запросы к Postgres и возвращает структурированные результаты.
+5. Orchestrator использует результаты tools и (при необходимости) LLM для формирования ответа.
+6. Ключевые события и корреляция запросов фиксируются в `logsvc`/`log_event` по `trace_id`.
+
+### Топология сервисов (Docker Compose)
 
 ```
                 ┌─────────────────────────────────────┐
@@ -76,6 +104,55 @@ Optional:
 
 ---
 
+## Контракты и интерфейсы
+
+### Orchestrator API
+
+#### `GET /health`
+Назначение: liveness/readiness (проверка, что сервис доступен).
+
+#### `POST /chat`
+Основная точка входа для пользовательских запросов.
+
+**Request**
+```json
+{
+  "message": "string",
+  "mode": "auto"
+}
+```
+
+**Response (целевой контракт)**
+```json
+{
+  "trace_id": "string",
+  "answer": "string",
+  "evidence": [
+    {
+      "source": "db",
+      "snippet": "string",
+      "meta": {
+        "org": "string",
+        "rubric": "string",
+        "region": "string",
+        "rating": 0
+      }
+    }
+  ]
+}
+```
+
+**Гарантии:**
+- `trace_id` должен коррелировать все ключевые шаги (orch → mcp → api → db) и соответствовать событиям в `logsvc`/`log_event`.
+- `answer` всегда строка.
+- `evidence` может быть пустым; при `mode="insights"` наличие evidence является предпочтительным, если данные найдены.
+
+**Планы расширения контракта:**
+- режимы `search` (подбор релевантных фрагментов) и `summary` (краткое резюме без рекомендаций);
+- параметры управления шумом: `max_evidence`, `min_rating`/`a0` на верхнем уровне запроса.
+
+---
+
 ## Данные и схема
 
 ### Источник данных (по умолчанию)
@@ -89,6 +166,21 @@ Optional:
 - `org`: организация (ключ, имя, адрес, регионы `a0/a1`, рубрики `rub[]`)
 - `rev`: отзыв (id, org_key, rating, text, `tsvector` по русскому)
 - `log_event`: события трассировки (trace_id, service, event, payload jsonb)
+
+### Data model (TL;DR)
+
+#### Таблица `rev`
+Одна строка = один отзыв. Используется для:
+- топов по рубрикам/регионам,
+- полнотекстового/подстрочного поиска,
+- извлечения негатива по рубрике + порогу рейтинга.
+
+Индекс:
+- `rev_org_rating_idx` — ускоряет фильтрацию по организации/объекту и рейтингу (см. `db/init.sql` как источник истины).
+
+Примечания:
+- точные названия колонок и типы см. в `db/init.sql` (каноническая схема);
+- при масштабировании рекомендуется добавить `created_at`, суррогатный `id` и (опционально) `tsvector`/FTS-инфраструктуру, если она еще не включена.
 
 ---
 
@@ -179,23 +271,17 @@ Endpoint:
 
 Пример (insights):
 ```bash
-curl -s http://localhost:9000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"негатив по ресторанам в Санкт-Петербурге: причины и цитаты","mode":"insights"}'
+curl -s http://localhost:9000/chat   -H "Content-Type: application/json"   -d '{"message":"негатив по ресторанам в Санкт-Петербурге: причины и цитаты","mode":"insights"}'
 ```
 
 Пример (leaders):
 ```bash
-curl -s http://localhost:9000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"худшие кафе в Москве","mode":"leaders"}'
+curl -s http://localhost:9000/chat   -H "Content-Type: application/json"   -d '{"message":"худшие кафе в Москве","mode":"leaders"}'
 ```
 
 Пример (compare):
 ```bash
-curl -s http://localhost:9000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"сравни кафе Москва vs Санкт-Петербург","mode":"compare"}'
+curl -s http://localhost:9000/chat   -H "Content-Type: application/json"   -d '{"message":"сравни кафе Москва vs Санкт-Петербург","mode":"compare"}'
 ```
 
 ---
@@ -215,6 +301,57 @@ MCP endpoint:
 - `org_negative_insights(org_key, n_terms=20, n_samples=5, max_docs=3000)`
 
 > Примечание: транспорт MCP использует SSE. Для корректной работы MCP-клиента требуется заголовок `Accept: text/event-stream`.
+
+### Контракты инструментов (целевые)
+
+#### `top_rubrics(n: int)`
+Возвращает топ-N рубрик по количеству отзывов.
+
+```json
+[
+  { "rubric": "string", "count": 123 }
+]
+```
+
+#### `top_regions(n: int)`
+Возвращает топ-N регионов по количеству отзывов.
+
+```json
+[
+  { "region": "string", "count": 123 }
+]
+```
+
+#### `text_search(qs: string, n: int)`
+Ищет отзывы по тексту (подстрока или FTS зависит от реализации API).
+
+```json
+[
+  { "org": "string", "rubric": "string", "region": "string", "rating": 0, "text": "string" }
+]
+```
+
+#### `negative_insights(rubric: string, a0: float, n_terms: int, n_samples: int, max_docs: int)`
+Собирает причины негатива по рубрике.
+
+Параметры:
+- `a0` — порог рейтинга (например, `<= 3.0` считаем негативом);
+- `n_terms` — количество ключевых тем/причин;
+- `n_samples` — количество примеров-цитат;
+- `max_docs` — лимит документов для анализа.
+
+```json
+{
+  "rubric": "string",
+  "threshold": 3.0,
+  "reasons": [{ "label": "string", "score": 0.0 }],
+  "evidence": [{ "snippet": "string", "meta": { "org": "string", "region": "string", "rating": 0 } }]
+}
+```
+
+Правило проектирования:
+- tools возвращают **структурированные данные**;
+- пользовательский текст/презентацию формирует Orchestrator.
 
 ---
 
@@ -303,10 +440,7 @@ curl -s http://localhost:9200/token -H "X-API-Key: change-me"
 
 3) Используйте токен:
 ```bash
-curl -s http://localhost:9000/chat \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
-  -d '{"message":"найди отзывы про парковку","mode":"search"}'
+curl -s http://localhost:9000/chat   -H "Content-Type: application/json"   -H "Authorization: Bearer <token>"   -d '{"message":"найди отзывы про парковку","mode":"search"}'
 ```
 
 ---
@@ -317,14 +451,14 @@ curl -s http://localhost:9000/chat \
 - Проверьте наличие файла модели по пути `models/qwen2.5-1.5b/...gguf`.
 - Проверьте переменные окружения `LLM_BACKEND=local` и `LOCAL_LLM_CHAT_URL`.
 
-**/mcp возвращает 406**
+**`/mcp` возвращает 406**
 - Используйте MCP-клиент с `Accept: text/event-stream` (SSE).
 
 **Insights/compare работают медленно**
 - Убедитесь, что загрузчик выполнил `ANALYZE` (включено по умолчанию в init/loader).
 - Проверьте наличие индексов (см. `db/init.sql`).
 
-**/chat возвращает 401**
+**`/chat` возвращает 401**
 - Включен `AUTH_ENABLED=1`, но запрос отправлен без токена. Либо выключите auth, либо получите JWT через `security`.
 
 ---
@@ -340,4 +474,4 @@ curl -s http://localhost:9000/chat \
 ---
 
 ## License
-Лицензия MIT
+MIT
