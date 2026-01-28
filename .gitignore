@@ -1,6 +1,9 @@
-models/
-.env
+*.env
+.env.*
+!*.env.example
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+hf_cache/
+models/

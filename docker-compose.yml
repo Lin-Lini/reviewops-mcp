@@ -1,5 +1,4 @@
 services:
-
   db:
     image: postgres:16
     environment:
@@ -7,71 +6,111 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
     ports:
-      - "5432:5432"
+    - 5432:5432
     volumes:
-      - db:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
-
+    - db:/var/lib/postgresql/data
+    - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
   api:
     build: ./svc/api
     environment:
       DB: postgresql://app:app@db:5432/app
     ports:
-      - "8000:8000"
+    - 8000:8000
     depends_on:
-      - db
-
+    - db
   loader:
     build: ./svc/loader
     environment:
       DB: postgresql://app:app@db:5432/app
       HF_REPO: d0rj/geo-reviews-dataset-2023
       HF_FILE: data/train-00000-of-00001-49261e4e5a35a5a0.parquet
-    depends_on:
-      - db
-    volumes:
-      - hf_cache:/root/.cache/huggingface
+      LOADER_ANALYZE: "1"
 
+    depends_on:
+    - db
+    volumes:
+    - hf_cache:/root/.cache/huggingface
   mcp:
     build: ./svc/mcp
     environment:
       DATA_API: http://api:8000
     ports:
-      - "8787:8787"
+    - 8787:8787
     depends_on:
-      - api
-  
-  llm:
+    - api
+  llm_local:
     image: ghcr.io/ggml-org/llama.cpp:server
     ports:
-      - "8081:8080"
+    - 8081:8080
     volumes:
-      - ./models:/models:ro
+    - ./models:/models:ro
     command:
-      [
-        "-m", "/models/qwen2.5-1.5b/qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "--host", "0.0.0.0",
-        "--port", "8080",
-        "--alias", "qwen2.5-1.5b",
-        "-c", "2048",
-        "-n", "256"
-      ]
-
+    - -m
+    - /models/qwen2.5-1.5b/qwen2.5-1.5b-instruct-q4_k_m.gguf
+    - --host
+    - 0.0.0.0
+    - --port
+    - '8080'
+    - --alias
+    - qwen2.5-1.5b
+    - -c
+    - '2048'
+    - -n
+    - '256'
+  llm:
+    build: ./svc/llm_gateway
+    environment:
+      LLM_BACKEND: ${LLM_BACKEND:-local}
+      LOCAL_LLM_CHAT_URL: http://llm_local:8080/v1/chat/completions
+      PROXYAPI_OPENAI_BASE: ${PROXYAPI_OPENAI_BASE:-https://openai.api.proxyapi.ru/v1}
+      PROXYAPI_KEY: ${PROXYAPI_KEY:-}
+      PROXYAPI_MODEL: ${PROXYAPI_MODEL:-gemini/gemini-2.5-flash-lite}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-120}
+    depends_on:
+      - llm_local
+    ports:
+      - 8080:8080
   orch:
     build: ./svc/orchestrator
-    environment:
-      MCP_URL: http://mcp:8787/mcp
-      DATA_API: http://api:8000
-      LLM_CHAT_URL: http://llm:8080/v1/chat/completions
-      LLM_MODEL: qwen2.5-1.5b
+    env_file:
+      - .env
     ports:
-      - "9000:9000"
+    - 9000:9000
     depends_on:
-      - mcp
-      - llm
+    - mcp
+    - llm
+    - logsvc
+    - security
+    - moderator
     restart: unless-stopped
-
+  logsvc:
+    build: ./svc/logsvc
+    environment:
+      DB: postgresql://app:app@db:5432/app
+    ports:
+    - 9100:9100
+    depends_on:
+    - db
+  security:
+    build: ./svc/security
+    environment:
+      JWT_SECRET: dev-secret
+      ROOT_API_KEY: change-me
+    ports:
+    - 9200:9200
+  moderator:
+    build: ./svc/moderator
+    ports:
+      - "9300:9300"
+    env_file:
+      - .env
+    environment:
+      MOD_SEMANTIC_INJECTION: ${MOD_SEMANTIC_INJECTION}
+      MOD_SEMANTIC_THRESHOLD: ${MOD_SEMANTIC_THRESHOLD}
+      MOD_BLOCK_ON_SYS_PROMPT: ${MOD_BLOCK_ON_SYS_PROMPT}
+      MOD_REDACT_SECRETS: ${MOD_REDACT_SECRETS}
+      MOD_INPUT_REDACT_ENV: ${MOD_INPUT_REDACT_ENV}
 
 volumes:
-  db:
-  hf_cache:
+  db: null
+  hf_cache: null

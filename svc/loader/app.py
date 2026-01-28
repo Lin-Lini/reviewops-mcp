@@ -74,6 +74,11 @@ with con.cursor() as cur:
                 rv
             )
         con.commit()
+        
+if os.getenv("LOADER_ANALYZE", "1") == "1":
+    with psycopg.connect(db) as con:
+        with con.cursor() as cur:
+            cur.execute("ANALYZE;")
 
 con.close()
 print("ok")

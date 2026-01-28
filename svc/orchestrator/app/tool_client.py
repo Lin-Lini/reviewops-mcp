@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 from typing import Any
 
@@ -80,8 +81,12 @@ class ToolClient:
                 res = await c.call_tool(name, args)
             self.mcp_ok = True
             return True, _unwrap(res)
-        except Exception:
+        except Exception as e:
             self.mcp_ok = False
+            strict = os.getenv("MCP_STRICT", "0") == "1"
+            print(f"[ToolClient] MCP call failed url={self.mcp_url} err={repr(e)} strict={strict}", flush=True)
+            if strict:
+                raise
 
         async with httpx.AsyncClient(timeout=180) as hc:
             if name == "top_rubrics":

@@ -1,74 +1,24 @@
 from __future__ import annotations
 
+import re
+from collections import Counter
+
 from fastapi import APIRouter
+
 from ..db import fetch_all, fetch_one
+from ..lib.reasons import filter_terms, filter_bigrams, build_reasons
 
 router = APIRouter()
 
-STOP_TERMS = {
-    "очень","просто","только","когда","после","больше","место","время","итоге","сегодня",
-    "потом","ничего","вообще","можно","через","этого","такие","такое","который","сразу",
-}
-STOP_BIGRAMS = {
-    "потому что","того что","никто не","ничего не","при этом","как будто","в итоге",
-    "первый раз","к сожалению","вообще не","это место","это заведение","данное заведение",
-}
+_NON_ALNUM = re.compile(r"[^а-яa-z0-9 ]+", re.IGNORECASE)
+_WORDS4 = re.compile(r"[а-яa-z0-9]{4,}", re.IGNORECASE)
 
-ASPECTS = [
-    ("Ожидание и скорость", ["минут","ждали","долго","ожид","через","40 минут","30 минут","20 минут","10 минут","15 минут"]),
-    ("Обслуживание и персонал", ["обслуживание","официант","официанты","персонал","хамств","груб","кассир","бариста"]),
-    ("Качество еды", ["вкусно","невкусно","блюда","еда","холод","пресн","паста","пицц","картошка","фри","мяс"]),
-    ("Цена и ценность", ["руб","дорог","цена","деньги","счет","стоимост"]),
-    ("Заказ и ошибки", ["заказ","принесли","перепут","не принесли","ожидание заказа","доставка"]),
-]
 
-def _filter_terms(items: list[dict], n: int) -> list[dict]:
-    out: list[dict] = []
-    for it in items:
-        w = (it.get("w") or "").strip()
-        if not w or w in STOP_TERMS:
-            continue
-        out.append(it)
-        if len(out) >= n:
-            break
-    return out
+def _tokenize(text: str) -> list[str]:
+    t = (text or "").lower()
+    t = _NON_ALNUM.sub(" ", t)
+    return _WORDS4.findall(t)
 
-def _filter_bigrams(items: list[dict], n: int) -> list[dict]:
-    out: list[dict] = []
-    for it in items:
-        g = (it.get("g") or "").strip()
-        if not g or g in STOP_BIGRAMS:
-            continue
-        out.append(it)
-        if len(out) >= n:
-            break
-    return out
-
-def _build_reasons(terms: list[dict], bigrams: list[dict], top_k: int = 5) -> list[dict]:
-    reasons: list[dict] = []
-    for label, keys in ASPECTS:
-        score = 0
-        evidence: list[str] = []
-        for it in bigrams:
-            g = it.get("g") or ""
-            for k in keys:
-                if k in g:
-                    score += int(it.get("cnt") or 0)
-                    if g not in evidence:
-                        evidence.append(g)
-                    break
-        for it in terms:
-            w = it.get("w") or ""
-            for k in keys:
-                if k in w:
-                    score += int(it.get("cnt") or 0)
-                    if w not in evidence:
-                        evidence.append(w)
-                    break
-        if score > 0:
-            reasons.append({"label": label, "score": score, "evidence": evidence[:3]})
-    reasons.sort(key=lambda x: x["score"], reverse=True)
-    return reasons[:top_k]
 
 @router.get("/insights/negative")
 def negative_insights(
@@ -80,7 +30,7 @@ def negative_insights(
     max_docs: int = 5000,
 ):
     # total stats (fast)
-    w_total = ["%s = ANY(o.rub)", "r.rating <> 0"]
+    w_total = ["o.rub @> ARRAY[%s]::text[]", "r.rating <> 0"]
     args_total = [rubric]
     if a0:
         w_total.append("o.a0 = %s")
@@ -90,22 +40,24 @@ def negative_insights(
         args_total.append(a1)
     where_total = " AND ".join(w_total)
 
-    total_stats = fetch_one(
-        f"""
-        SELECT
-          count(*)::int as total_reviews,
-          avg(NULLIF(r.rating,0))::float as avg_rating_all,
-          sum((r.rating<=2)::int)::int as bad_reviews,
-          sum((r.rating=5)::int)::int as good_reviews
-        FROM rev r
-        JOIN org o USING(org_key)
-        WHERE {where_total}
-        """,
-        tuple(args_total),
-    ) or {}
+    total_stats = (
+        fetch_one(
+            f"""
+            SELECT
+              count(*)::int as total_reviews,
+              avg(NULLIF(r.rating,0))::float as avg_rating_all,
+              sum((r.rating<=2)::int)::int as bad_reviews,
+              sum((r.rating=5)::int)::int as good_reviews
+            FROM rev r
+            JOIN org o USING(org_key)
+            WHERE {where_total}
+            """,
+            tuple(args_total),
+        )
+        or {}
+    )
 
-    # negative slice (docs)
-    w = ["%s = ANY(o.rub)", "r.rating BETWEEN 1 AND 2"]
+    w = ["o.rub @> ARRAY[%s]::text[]", "r.rating BETWEEN 1 AND 2"]
     args = [rubric]
     if a0:
         w.append("o.a0 = %s")
@@ -115,85 +67,69 @@ def negative_insights(
         args.append(a1)
     where = " AND ".join(w)
 
-    bad_stats = fetch_one(
-        f"""
-        SELECT
-          count(*)::int as reviews,
-          avg(NULLIF(r.rating,0))::float as avg_rating,
-          sum((r.rating<=2)::int)::int as bad
-        FROM rev r
-        JOIN org o USING(org_key)
-        WHERE {where}
-        """,
-        tuple(args),
-    ) or {}
-
-    docs_sql = f"""
-    WITH docs AS (
-      SELECT r.rev_id, r.text, r.rating, o.name_ru, o.address
-      FROM rev r
-      JOIN org o USING(org_key)
-      WHERE {where}
-      ORDER BY r.rating ASC
-      LIMIT %s
-    )
-    """
-
-    terms = fetch_all(
-        docs_sql + """
-        SELECT w, count(*)::int as cnt
-        FROM (
-          SELECT unnest(regexp_split_to_array(
-            regexp_replace(lower(text), '[^а-яa-z0-9 ]+', ' ', 'g'),
-            '\\s+'
-          )) AS w
-          FROM docs
-        ) t
-        WHERE length(w) >= 4
-        GROUP BY w
-        ORDER BY cnt DESC
-        LIMIT %s
-        """,
-        tuple(args + [max_docs, n_terms]),
-    )
-
-    bigrams = fetch_all(
-        docs_sql + """
-        , toks AS (
-          SELECT
-            regexp_split_to_array(
-              regexp_replace(lower(text), '[^а-яa-z0-9 ]+', ' ', 'g'),
-              '\\s+'
-            ) AS a
-          FROM docs
-        ),
-        bg AS (
-          SELECT (a[i] || ' ' || a[i+1]) AS g
-          FROM toks, generate_subscripts(a, 1) AS i
-          WHERE i < array_length(a, 1)
+    bad_stats = (
+        fetch_one(
+            f"""
+            SELECT
+              count(*)::int as reviews,
+              avg(NULLIF(r.rating,0))::float as avg_rating,
+              sum((r.rating<=2)::int)::int as bad
+            FROM rev r
+            JOIN org o USING(org_key)
+            WHERE {where}
+            """,
+            tuple(args),
         )
-        SELECT g, count(*)::int as cnt
-        FROM bg
-        WHERE length(g) >= 6
-        GROUP BY g
-        ORDER BY cnt DESC
-        LIMIT %s
-        """,
-        tuple(args + [max_docs, n_terms]),
+        or {}
     )
 
-    samples = fetch_all(
-        docs_sql + """
-        SELECT rev_id, rating, name_ru, address, left(text, 600) as text
+    TEXT_LIMIT = 800
+    docs = fetch_all(
+        f"""
+        WITH docs AS (
+          SELECT r.rev_id, left(r.text, %s) as text, r.rating, o.name_ru, o.address
+          FROM rev r
+          JOIN org o USING(org_key)
+          WHERE {where}
+          ORDER BY r.rating ASC
+          LIMIT %s
+        )
+        SELECT rev_id, rating, name_ru, address, text
         FROM docs
-        LIMIT %s
         """,
-        tuple(args + [max_docs, n_samples]),
+        tuple([TEXT_LIMIT] + args + [max_docs]),
     )
 
-    f_terms = _filter_terms(terms, n_terms)
-    f_bigrams = _filter_bigrams(bigrams, n_terms)
-    reasons = _build_reasons(f_terms, f_bigrams, top_k=5)
+    term_cnt: Counter[str] = Counter()
+    bigram_cnt: Counter[str] = Counter()
+
+    for d in docs:
+        toks = _tokenize(d.get("text") or "")
+        if not toks:
+            continue
+        term_cnt.update(toks)
+        for i in range(len(toks) - 1):
+            bigram_cnt[f"{toks[i]} {toks[i+1]}"] += 1
+
+    terms_raw = [{"w": w, "cnt": int(c)} for w, c in term_cnt.most_common(max(n_terms * 25, 250))]
+    bigrams_raw = [{"g": g, "cnt": int(c)} for g, c in bigram_cnt.most_common(max(n_terms * 35, 400))]
+
+    f_terms = filter_terms(terms_raw, n_terms)
+    f_bigrams = filter_bigrams(bigrams_raw, n_terms)
+    reasons = build_reasons(f_terms, f_bigrams, top_k=5)
+
+    samples = []
+    for d in docs[: max(n_samples, 0)]:
+        txt = (d.get("text") or "")[:600]
+        samples.append(
+            {
+                "rev_id": d.get("rev_id"),
+                "rating": d.get("rating"),
+                "name_ru": d.get("name_ru"),
+                "address": d.get("address"),
+                "text": txt,
+            }
+        )
 
     return {
         "filters": {"rubric": rubric, "a0": a0, "a1": a1},

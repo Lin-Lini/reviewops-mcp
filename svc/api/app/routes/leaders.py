@@ -49,7 +49,7 @@ def leaders_best(
     min_reviews: int = Query(20, ge=1),
     n: int = Query(20, ge=1, le=200),
 ):
-    w = ["%s = ANY(o.rub)", "r.rating BETWEEN 1 AND 5"]
+    w = ["o.rub @> ARRAY[%s]::text[]", "r.rating BETWEEN 1 AND 5"]
     args = [rubric]
 
     if a0:

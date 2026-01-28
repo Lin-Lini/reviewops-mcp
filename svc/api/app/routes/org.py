@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 from ..db import fetch_all, fetch_one
+from ..lib.reasons import filter_terms, filter_bigrams, build_reasons
 
 router = APIRouter()
 
@@ -9,7 +10,7 @@ def org_search(qs: str = Query(..., min_length=1), n: int = 20):
     return fetch_all(
         "SELECT org_key, name_ru, address "
         "FROM org "
-        "WHERE name_ru %% %s OR address %% %s "
+        "WHERE name_ru % %s OR address % %s "
         "ORDER BY greatest(similarity(name_ru,%s), similarity(address,%s)) DESC "
         "LIMIT %s",
         (s, s, s, s, n)
@@ -121,11 +122,16 @@ def org_negative_insights(
         (org_key, max_docs, n_samples)
     )
 
+    f_terms = filter_terms(terms, n_terms)
+    f_bigrams = filter_bigrams(bigrams, n_terms)
+    reasons = build_reasons(f_terms, f_bigrams, top_k=5)
+
     return {
         "filters": {"org_key": org_key},
         "stats": stats,
-        "top_terms": terms,
-        "top_bigrams": bigrams,
+        "reasons": reasons,
+        "top_terms": f_terms,
+        "top_bigrams": f_bigrams,
         "samples": samples,
         "max_docs": max_docs,
     }
