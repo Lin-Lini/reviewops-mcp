@@ -34,18 +34,18 @@
 
 ```mermaid
 flowchart LR
-  U[User / Client] -->|POST /chat| ORCH[orch: Orchestrator<br/>LLM gateway]
-  ORCH -->|SSE /mcp (tools)| MCP[mcp: FastMCP server]
-  MCP -->|HTTP| API[api: Analytics API (FastAPI)]
-  API -->|SQL| DB[(db: Postgres)]
-  ORCH -->|OpenAI-compatible<br/>/v1/chat/completions| LLM[llm: llama.cpp server]
+    U["User / Client"] -->|"POST /chat"| ORCH["orch: Orchestrator (LLM gateway)"]
+    ORCH -->|"SSE /mcp tools"| MCP["mcp: FastMCP server"]
+    MCP -->|"HTTP"| API["api: Analytics API (FastAPI)"]
+    API -->|"SQL"| DB[(db: Postgres)]
+    ORCH -->|"OpenAI-compatible /v1/chat/completions"| LLM["llm: llama.cpp server"]
 
-  ORCH --> LOG[logsvc: events]
-  MCP --> LOG
-  API --> LOG
+    ORCH --> LOG["logsvc: events"]
+    MCP --> LOG
+    API --> LOG
 
-  SEC[security: JWT (opt)] -.-> ORCH
-  MOD[moderator: input/output (opt)] -.-> ORCH
+    SEC["security: JWT (opt)"] -.-> ORCH
+    MOD["moderator: input/output (opt)"] -.-> ORCH
 ```
 
 **Логика взаимодействия:**
