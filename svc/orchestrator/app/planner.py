@@ -166,6 +166,33 @@ async def pick_filters_with_llm(llm, msg: str, rubrics: list[str], regions: list
 
     return rb, a0
 
+async def pick_mode_with_llm(llm, msg: str):
+    sys = (
+        "Ты маршрутизатор запросов.\n"
+        "Верни ТОЛЬКО JSON: {\"mode\": \"search|insights|leaders|compare\"}.\n"
+        "Правила:\n"
+        "- search: если пользователь просит найти/поиск/отзывы по слову.\n"
+        "- compare: если просит сравнить (vs, сравни, и т.п.).\n"
+        "- leaders: если просит лучшие/худшие/топ/антилидеры.\n"
+        "- insights: если просит причины негатива/почему/что улучшить/разбери.\n"
+        "Если не уверен — выбери insights."
+    )
+
+    user = "Запрос: " + msg
+
+    out = await llm.chat(
+        [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        max_tokens=60,
+        temperature=0.0,
+    )
+
+    j = _j(out) or {}
+    mode = j.get("mode")
+    mode = mode.strip().lower() if isinstance(mode, str) else None
+
+    if mode not in ("search", "compare", "leaders", "insights"):
+        return None
+    return mode
 
 async def pick_compare_with_llm(llm, msg: str, rubrics: list[str], regions: list[str]):
     # минимальные алиасы (не “вся Россия”, а популярный сленг)

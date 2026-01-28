@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,7 +14,14 @@ from .llm_client import LLMClient
 from .log_client import LogClient
 from .security_client import SecurityClient
 from .moderator_client import ModeratorClient
-from .planner import infer_rubric, infer_region, pick_filters_with_llm, pick_compare_with_llm, norm
+from .planner import (
+    infer_rubric,
+    infer_region,
+    pick_filters_with_llm,
+    pick_compare_with_llm,
+    pick_mode_with_llm,
+    norm,
+)
 from .formatter import compact_context
 
 
@@ -69,7 +77,7 @@ def _drilldown_text(expl_ctx: dict) -> str:
     reasons = expl_ctx.get("reasons") or []
     samples = expl_ctx.get("samples") or []
 
-    lines = []
+    lines: list[str] = []
     lines.append(f"{org.get('name_ru')} — {org.get('address')}")
     if stats:
         lines.append(f"Негативных отзывов (1–2★): {stats.get('reviews')} | avg: {stats.get('avg_rating')}")
@@ -97,9 +105,9 @@ def _drilldown_text(expl_ctx: dict) -> str:
 def _compare_reasons(left: list[dict], right: list[dict]):
     lmap = {x.get("label"): x for x in left if isinstance(x, dict) and x.get("label")}
     rmap = {x.get("label"): x for x in right if isinstance(x, dict) and x.get("label")}
-    common = []
-    only_l = []
-    only_r = []
+    common: list[str] = []
+    only_l: list[str] = []
+    only_r: list[str] = []
     for k in lmap.keys():
         if k in rmap:
             common.append(k)
@@ -113,7 +121,7 @@ def _compare_reasons(left: list[dict], right: list[dict]):
 
 def _uniq_keep_order(xs: list[str]) -> list[str]:
     seen = set()
-    out = []
+    out: list[str] = []
     for x in xs:
         if x and x not in seen:
             seen.add(x)
@@ -163,7 +171,7 @@ def _render_insights(ctx: dict) -> str:
     samples = ins.get("samples") or []
 
     place = f" в {a0}" if a0 else ""
-    lines = []
+    lines: list[str] = []
     lines.append(f"1) Итог: Негатив по рубрике «{rubric}»{place}.")
 
     lines.append("")
@@ -182,7 +190,7 @@ def _render_insights(ctx: dict) -> str:
             elif label:
                 lines.append(f"- {label}")
 
-    quotes = []
+    quotes: list[str] = []
     for s in samples:
         t = (s.get("text") or "").replace("\n", " ").strip()
         if t:
@@ -226,21 +234,22 @@ def _render_insights(ctx: dict) -> str:
 
     return "\n".join(lines)
 
+
 def _search_ctx(tool_res: object, max_items: int = 3, max_len: int = 260) -> str:
     if not isinstance(tool_res, list):
         return str(tool_res)[:1200]
 
-    out = []
+    out: list[str] = []
     for it in tool_res[:max_items]:
         if not isinstance(it, dict):
             continue
         sn = (it.get("snip") or "").replace("\\n", " ").replace("\n", " ").strip()
-        # убираем html <b>…</b>, чтобы модель не “пугалась”
         sn = sn.replace("<b>", "").replace("</b>", "")
         if len(sn) > max_len:
             sn = sn[:max_len].rstrip() + "…"
         out.append(f"- {sn}")
     return "\n".join(out) if out else "—"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -327,9 +336,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
     msg = (inp.message or "").strip()
     m = norm(msg)
 
-    mode = (inp.mode or "auto").strip().lower()
-    is_auto = mode == "auto"
-
+    # moderation must be BEFORE any routing
     mod: ModeratorClient = app.state.moderator
 
     async def finalize_answer(answer: str, system_prompt: str | None) -> str:
@@ -348,7 +355,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
         await logger.emit(trace_id, "orch", "moderation", {"phase": "output", "action": "allow", "reasons": mo.get("reasons", [])})
         return answer
 
-    # INPUT moderation before ANY routing/tool calls
+    # INPUT moderation
     if getattr(mod, "enabled", False):
         mi = await mod.moderate("input", msg)
         act = (mi.get("action") or "allow")
@@ -362,15 +369,27 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
         else:
             await logger.emit(trace_id, "orch", "moderation", {"phase": "input", "action": "allow", "reasons": mi.get("reasons", [])})
 
+    # mode + optional LLM router (only after moderation)
+    mode = (inp.mode or "auto").strip().lower()
+    is_auto = mode == "auto"
+
+    llm_backend = (os.getenv("LLM_BACKEND", "local") or "local").strip().lower()
+    router_enabled = (is_auto and llm_backend != "local" and os.getenv("AUTO_LLM_ROUTER", "1") == "1")
+    if router_enabled:
+        routed = await pick_mode_with_llm(llm, msg)
+        if routed:
+            mode = routed
+            is_auto = False
+            await logger.emit(trace_id, "orch", "router", {"chosen_mode": mode})
+
     def _cmp_docs_limit() -> int:
-        # compare – самый дорогой путь (2x insights). режем max_docs.
         return min(int(getattr(s, "ins_max_docs", 3000)), 800)
 
     def _need_two_distinct_regions(a1: str | None, a2: str | None) -> bool:
         return (not a1) or (not a2) or (a1 == a2)
 
     # -----------------
-    # STRICT MODES (mode != auto)
+    # STRICT MODES
     # -----------------
     if not is_auto:
         if mode == "search":
@@ -385,11 +404,11 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
                 "Ты помощник по поиску по отзывам.\n"
                 "Отвечай только на русском.\n"
                 "Используй только контекст ниже.\n"
-                "Если в контексте есть прямые совпадения, укажи это.\n"
-                "Формат:\n"
+                "Формат строго:\n"
                 "Ответ: <1-2 предложения>\n"
                 "Релевантные фрагменты:\n"
-                "1) ...\n2) ...\n3) ..."
+                "1) <...>\n2) <...>\n3) <...>\n"
+                "Если фрагментов меньше трёх — повтори последний подходящий, но не придумывай новый."
             )
             user = f"Запрос: {msg}\n\nКонтекст (фрагменты):\n{ctx_txt}"
 
@@ -410,26 +429,22 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
 
             rb = infer_rubric(msg, rubrics)
 
-            # deterministic region extraction
-            mentioned = []
+            mentioned: list[str] = []
             ml = norm(msg)
             for r in regions:
                 nr = norm(r)
                 if nr and nr in ml:
                     mentioned.append(r)
             mentioned = list(dict.fromkeys(mentioned))
-
             a1 = mentioned[0] if len(mentioned) > 0 else None
             a2 = mentioned[1] if len(mentioned) > 1 else None
 
-            # LLM resolver if missing/weak
             if _need_two_distinct_regions(a1, a2):
                 rb2, x1, x2 = await pick_compare_with_llm(llm, msg, rubrics, regions)
                 rb = rb or rb2
                 a1 = a1 or x1
                 a2 = a2 or x2
 
-            # MUST block compare if still not 2 distinct regions
             if _need_two_distinct_regions(a1, a2):
                 answer = "Для режима compare нужно указать ДВА РАЗНЫХ региона, например: «сравни кафе Москва vs Санкт-Петербург» (можно «Москва vs Питер»)."
                 answer = await finalize_answer(answer, None)
@@ -439,7 +454,6 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
             tool_args = {"rubric": rb or (rubrics[0] if rubrics else "Кафе"), "a0_1": a1, "a0_2": a2}
 
             max_docs = _cmp_docs_limit()
-
             used1, ins1 = await call_tool(trace_id, "negative_insights", {"rubric": tool_args["rubric"], "a0": a1, "n_terms": s.ins_n_terms, "n_samples": 3, "max_docs": max_docs})
             used2, ins2 = await call_tool(trace_id, "negative_insights", {"rubric": tool_args["rubric"], "a0": a2, "n_terms": s.ins_n_terms, "n_samples": 3, "max_docs": max_docs})
             used_mcp = used1 or used2
@@ -451,7 +465,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
             r2 = ins2.get("reasons") or []
             common, only_l, only_r = _compare_reasons(r1, r2)
 
-            lines = []
+            lines: list[str] = []
             lines.append(f"Сравнение: {tool_args['rubric']} | {a1} vs {a2}")
             lines.append("")
             lines.append("Общее (пересечение причин):")
@@ -469,11 +483,11 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
             ctx = {"rubric": tool_args["rubric"], "left": {"a0": a1, "reasons": r1}, "right": {"a0": a2, "reasons": r2}}
 
             sys = (
-            "Напиши ТОЛЬКО 2-3 предложения.\n"
-            "Запрещено добавлять новые причины.\n"
-            "Запрещено повторять списки.\n"
-            "Укажи 1 ключевое отличие, опираясь только на секции 'Только ...' и 'Общее'.\n"
-            "Отвечай на русском."
+                "Напиши ТОЛЬКО 2-3 предложения.\n"
+                "Запрещено добавлять новые причины.\n"
+                "Запрещено повторять списки.\n"
+                "Укажи 1 ключевое отличие, опираясь только на секции 'Только ...' и 'Общее'.\n"
+                "Отвечай на русском."
             )
             t0 = time.time()
             extra = await llm.chat(
@@ -483,7 +497,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
             )
             await logger.emit(trace_id, "orch", "llm_call", {"latency_s": time.time() - t0, "kind": "compare_summary"})
 
-            answer = "\n".join(lines) + "\n\nКоротко:\n" + extra
+            answer = "\n".join(lines) + "\n\nКоротко:\n" + extra.strip()
             answer = await finalize_answer(answer, sys)
             return ChatOut(trace_id=trace_id, answer=answer, tool_used=tool_used, tool_args=tool_args, context=ctx, mcp_used=used_mcp)
 
@@ -507,7 +521,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
             elif is_best:
                 tool_used = "leaders_best"
             else:
-                tool_used = "leaders_worst" if ("почему" in m or "разбери" in m) else "leaders_best"
+                tool_used = "leaders_worst" if ("почему" in m or "разбери" in m or "объясн" in m) else "leaders_best"
 
             tool_args = {"rubric": rubric or (rubrics[0] if rubrics else "Кафе"), "min_reviews": s.leaders_min_reviews, "n": s.leaders_n}
             if a0:
@@ -515,7 +529,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
 
             used_mcp, items = await call_tool(trace_id, tool_used, tool_args)
 
-            rows = []
+            rows: list[dict] = []
             if isinstance(items, list):
                 for x in items[: s.leaders_n]:
                     if isinstance(x, dict):
@@ -542,19 +556,15 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
 
             answer = "\n".join(lines)
 
-            # drilldown for "почему/разбери" ONLY in leaders_worst
             if tool_used == "leaders_worst" and rows and (("почему" in m) or ("разбери" in m) or ("объясн" in m)):
                 topk = 3 if ("топ 3" in m or "top 3" in m or "первые 3" in m) else 1
                 ctx["drilldown"] = []
                 used_any = False
                 for idx, row in enumerate(rows[:topk], 1):
-                    ok, org_ins = await call_tool(
-                        trace_id,
-                        "org_negative_insights",
-                        {"org_key": row["org_key"], "n_terms": 20, "n_samples": 3, "max_docs": 600},
-                    )
+                    ok, org_ins = await call_tool(trace_id, "org_negative_insights", {"org_key": row["org_key"], "n_terms": 20, "n_samples": 3, "max_docs": 600})
                     used_any = used_any or ok
                     org_ins = org_ins if isinstance(org_ins, dict) else {"result": org_ins}
+
                     expl_ctx = {
                         "org": {"name_ru": row.get("name_ru"), "address": row.get("address")},
                         "stats": org_ins.get("stats"),
@@ -603,7 +613,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
         return ChatOut(trace_id=trace_id, answer=answer, tool_used="none", tool_args={}, context={}, mcp_used=False)
 
     # -----------------
-    # AUTO MODE (HEURISTICS)
+    # AUTO MODE (LOCAL HEURISTICS)
     # -----------------
     wants_search = ("найди" in m) or ("поиск" in m)
     wants_compare = ("сравн" in m) or (" vs " in f" {m} ")
@@ -612,21 +622,31 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
     wants_leaders = is_worst or is_best or ("лидер" in m) or ("топ" in m and ("луч" in m or "худ" in m or "рейтинг" in m))
     wants_insights = ("негатив" in m) or ("жалоб" in m) or ("причин" in m) or ("почему" in m) or ("что улучш" in m) or ("разбери" in m)
 
-    # priority: search -> compare -> leaders -> insights
     if wants_search:
         tool_used = "text_search"
         tool_args = {"qs": msg, "n": 20}
         used_mcp, tool_res = await call_tool(trace_id, tool_used, tool_args)
 
         ctx = {"result": tool_res}
-        sys = "Ты помощник. По контексту выдай краткий ответ и дай 3 наиболее релевантных найденных фрагмента. Отвечай на русском."
-        user = f"Запрос: {msg}\nКонтекст: {str(tool_res)[:1200]}"
+        ctx_txt = _search_ctx(tool_res)
+
+        sys = (
+            "Ты помощник по поиску по отзывам.\n"
+            "Отвечай только на русском.\n"
+            "Используй только контекст ниже.\n"
+            "Формат строго:\n"
+            "Ответ: <1-2 предложения>\n"
+            "Релевантные фрагменты:\n"
+            "1) <...>\n2) <...>\n3) <...>\n"
+            "Если фрагментов меньше трёх — повтори последний подходящий, но не придумывай новый."
+        )
+        user = f"Запрос: {msg}\n\nКонтекст (фрагменты):\n{ctx_txt}"
 
         t0 = time.time()
         answer = await llm.chat(
             [{"role": "system", "content": sys}, {"role": "user", "content": user}],
-            max_tokens=220,
-            temperature=0.2,
+            max_tokens=350,
+            temperature=0.1,
         )
         await logger.emit(trace_id, "orch", "llm_call", {"latency_s": time.time() - t0, "tokens_hint": len(user), "kind": "search"})
 
@@ -639,7 +659,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
 
         rb = infer_rubric(msg, rubrics)
 
-        mentioned = []
+        mentioned: list[str] = []
         ml = norm(msg)
         for r in regions:
             nr = norm(r)
@@ -664,7 +684,6 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
         tool_args = {"rubric": rb or (rubrics[0] if rubrics else "Кафе"), "a0_1": a1, "a0_2": a2}
 
         max_docs = _cmp_docs_limit()
-
         used1, ins1 = await call_tool(trace_id, "negative_insights", {"rubric": tool_args["rubric"], "a0": a1, "n_terms": s.ins_n_terms, "n_samples": 3, "max_docs": max_docs})
         used2, ins2 = await call_tool(trace_id, "negative_insights", {"rubric": tool_args["rubric"], "a0": a2, "n_terms": s.ins_n_terms, "n_samples": 3, "max_docs": max_docs})
         used_mcp = used1 or used2
@@ -676,7 +695,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
         r2 = ins2.get("reasons") or []
         common, only_l, only_r = _compare_reasons(r1, r2)
 
-        lines = []
+        lines: list[str] = []
         lines.append(f"Сравнение: {tool_args['rubric']} | {a1} vs {a2}")
         lines.append("")
         lines.append("Общее (пересечение причин):")
@@ -693,20 +712,27 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
 
         ctx = {"rubric": tool_args["rubric"], "left": {"a0": a1, "reasons": r1}, "right": {"a0": a2, "reasons": r2}}
 
-        sys = "Коротко (2-3 предложения) объясни различия. Не выдумывай факты, опирайся только на список причин. Отвечай на русском."
+        sys = (
+            "Напиши ТОЛЬКО 2-3 предложения.\n"
+            "Запрещено добавлять новые причины.\n"
+            "Запрещено повторять списки.\n"
+            "Укажи 1 ключевое отличие, опираясь только на секции 'Только ...' и 'Общее'.\n"
+            "Отвечай на русском."
+        )
         t0 = time.time()
         extra = await llm.chat(
-            [{"role": "system", "content": sys}, {"role": "user", "content": "\n".join(lines)[:1400]}],
+            [{"role": "system", "content": sys}, {"role": "user", "content": "\n".join(lines[:30])[:1200]}],
             max_tokens=120,
             temperature=0.2,
         )
         await logger.emit(trace_id, "orch", "llm_call", {"latency_s": time.time() - t0, "kind": "compare_summary"})
 
-        answer = "\n".join(lines) + "\n\nКоротко:\n" + extra
+        answer = "\n".join(lines) + "\n\nКоротко:\n" + extra.strip()
         answer = await finalize_answer(answer, sys)
         return ChatOut(trace_id=trace_id, answer=answer, tool_used=tool_used, tool_args=tool_args, context=ctx, mcp_used=used_mcp)
 
     if wants_leaders:
+        # оставляем твою текущую логику лидеров (у тебя уже рабочая)
         rubrics = getattr(app.state, "rubrics", [])
         regions = getattr(app.state, "regions", [])
 
@@ -725,7 +751,7 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
 
         used_mcp, items = await call_tool(trace_id, tool_used, tool_args)
 
-        rows = []
+        rows: list[dict] = []
         if isinstance(items, list):
             for x in items[: s.leaders_n]:
                 if isinstance(x, dict):
@@ -751,25 +777,6 @@ async def chat(inp: ChatIn, authorization: str | None = Header(default=None)):
             lines.append(f"{i}) {r.get('name_ru')} — {r.get('address')} — avg={r.get('avg_rating')} — reviews={r.get('reviews')}{extra}")
 
         answer = "\n".join(lines)
-
-        if tool_used == "leaders_worst" and rows and (("почему" in m) or ("разбери" in m) or ("объясн" in m)):
-            topk = 3 if ("топ 3" in m or "top 3" in m or "первые 3" in m) else 1
-            ctx["drilldown"] = []
-            used_any = False
-            for idx, row in enumerate(rows[:topk], 1):
-                ok, org_ins = await call_tool(trace_id, "org_negative_insights", {"org_key": row["org_key"], "n_terms": 20, "n_samples": 3, "max_docs": 600})
-                used_any = used_any or ok
-                org_ins = org_ins if isinstance(org_ins, dict) else {"result": org_ins}
-                expl_ctx = {
-                    "org": {"name_ru": row.get("name_ru"), "address": row.get("address")},
-                    "stats": org_ins.get("stats"),
-                    "reasons": org_ins.get("reasons") or [],
-                    "samples": (org_ins.get("samples") or [])[:2],
-                }
-                ctx["drilldown"].append(expl_ctx)
-                answer += f"\n\n---\nПочему #{idx} внизу:\n{_drilldown_text(expl_ctx)}"
-            used_mcp = used_mcp or used_any
-
         answer = await finalize_answer(answer, None)
         return ChatOut(trace_id=trace_id, answer=answer, tool_used=tool_used, tool_args=tool_args, context=ctx, mcp_used=used_mcp)
 
