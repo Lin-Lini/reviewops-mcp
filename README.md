@@ -61,7 +61,7 @@ Client / User → │ Orchestrator (FastAPI) :9000         │
                     └───────────────────────────┘
 
 LLM side:
-┌───────────────────────────┐       ┌───────────────────────────┐
+┌───────────────────────────┐        ┌───────────────────────────┐
 │ LLM Gateway :8080          │  →    │ llama.cpp server :8081     │
 │ /v1/chat/completions       │       │ (local GGUF)               │
 │ backend=local|proxyapi     │       └───────────────────────────┘
@@ -340,4 +340,4 @@ curl -s http://localhost:9000/chat \
 ---
 
 ## License
-Лицензия не указана. Для публичного open-source репозитория рекомендуется добавить MIT или Apache-2.0.
+Лицензия MIT
